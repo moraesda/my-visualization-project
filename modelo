@@ -1,0 +1,317 @@
+import io
+import os
+import re
+import unicodedata
+from glob import glob
+from datetime import datetime
+
+import pandas as pd
+from flask import Flask, request, render_template_string, send_file
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+
+app = Flask(__name__)
+
+# ------------------------------------------------------------------
+# Configurações
+# ------------------------------------------------------------------
+BASE_DIR = os.path.dirname(__file__)
+FEEDBACK_PATH = os.path.join(BASE_DIR, "feedback.csv")
+
+modelo_st = SentenceTransformer('paraphrase-MiniLM-L6-v2')
+
+def salvar_feedback(login, area_antiga, area_atual_prevista, confirmado):
+    feedback = pd.DataFrame([{
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "login": login,
+        "area_antiga": area_antiga,
+        "area_atual_prevista": area_atual_prevista,
+        "confirmado": confirmado
+    }])
+    if os.path.exists(FEEDBACK_PATH):
+        feedback.to_csv(FEEDBACK_PATH, mode="a", header=False, index=False)
+    else:
+        feedback.to_csv(FEEDBACK_PATH, index=False)
+
+def extrair_data_arquivo(nome_arquivo):
+    match = re.search(r"(\d{8})", os.path.basename(nome_arquivo))
+    if match:
+        return pd.to_datetime(match.group(1), format="%Y%m%d")
+    return pd.Timestamp.min
+
+def normalizar(texto):
+    if pd.isna(texto): return ""
+    texto = texto.lower()
+    return unicodedata.normalize('NFKD', texto).encode('ASCII','ignore').decode('utf-8').strip()
+
+# ------------------------------------------------------------------
+# Carregamento e preparação dos dados
+# ------------------------------------------------------------------
+arquivos = sorted(glob(os.path.join(BASE_DIR, "base_rh", "*.xls")),
+                  key=lambda x: extrair_data_arquivo(x))
+print(f"Arquivos encontrados: {len(arquivos)}")
+
+bases = []
+for caminho in arquivos:
+    data_ref = extrair_data_arquivo(caminho)
+    if data_ref > pd.Timestamp.min:
+        df = pd.read_excel(caminho, engine="xlrd")
+        df.columns = df.columns.str.strip()
+        df["Data Referência"] = data_ref
+        bases.append(df)
+    else:
+        print(f"⚠️ Não foi possível extrair data do nome: {caminho}")
+
+if not bases:
+    raise ValueError("Nenhum arquivo foi processado com sucesso.")
+
+df_full = pd.concat(bases, ignore_index=True)
+colunas = ["Matricula","Nome","Login","Área","Diretoria","Quebra",
+           "ID Área","Empresa","ID Imediato","Nome Imedi",
+           "Data Referência","Nivel","Hierarquia","Estrutura"]
+df_ativos = df_full[colunas].copy()
+df_ativos["Área Normalizada"] = df_ativos["Área"].apply(normalizar)
+df_ativos["Login"] = df_ativos["Login"].astype(str).str.lower().str.strip()
+df_ativos.sort_values(["Matricula","Data Referência"], inplace=True)
+df_ativos["Área Anterior"] = df_ativos.groupby("Matricula")["Área Normalizada"].shift(1)
+
+areas_unicas     = df_ativos["Área Normalizada"].dropna().unique()
+embeddings_areas = modelo_st.encode(areas_unicas)
+
+def encontrar_area_similar(consulta_area):
+    vec = modelo_st.encode([normalizar(consulta_area)])
+    scores = cosine_similarity(vec, embeddings_areas)[0]
+    if os.path.exists(FEEDBACK_PATH):
+        df_fb = pd.read_csv(FEEDBACK_PATH)
+        positivos = df_fb[
+            (df_fb['area_antiga'].str.lower() == consulta_area.lower()) &
+            (df_fb['confirmado'] == 1)
+        ]
+        for idx, area in enumerate(areas_unicas):
+            if any(normalizar(area) == normalizar(a) for a in positivos['area_atual_prevista']):
+                scores[idx] += 0.2
+    melhor = scores.argmax()
+    return areas_unicas[melhor], scores[melhor]
+
+def consultar_area_atual(area_antiga=None, login_usuario=None):
+    # seleciona tráfego por login ou por área antiga
+    if login_usuario:
+        login = login_usuario.strip().lower()
+        colabs = df_ativos[df_ativos["Login"] == login]
+        if colabs.empty:
+            return f"❌ Login '{login_usuario}' não encontrado no histórico."
+        colabs = colabs.sort_values("Data Referência")
+        area_antiga = colabs["Área"].iloc[0]
+    elif area_antiga:
+        norm = normalizar(area_antiga)
+        colabs = df_ativos[df_ativos["Área Normalizada"] == norm]
+        if colabs.empty:
+            similar, score = encontrar_area_similar(area_antiga)
+            colabs = df_ativos[df_ativos["Área Normalizada"] == similar]
+            if colabs.empty:
+                return f"❌ Área '{area_antiga}' não encontrada nem similar."
+            area_antiga = similar
+    else:
+        return "❌ Forneça uma área ou login."
+
+    area_antiga_norm = normalizar(area_antiga)
+    ult_data = colabs["Data Referência"].max()
+    matriculas = colabs["Matricula"].unique()
+
+    # monta trajetória completa
+    trajeto = (
+        df_ativos[df_ativos["Matricula"].isin(matriculas)]
+        .sort_values(["Matricula", "Data Referência"])
+        .drop_duplicates(subset=["Matricula","Área Normalizada","Data Referência"])
+    )
+    trajeto_filtrado = trajeto[trajeto["Área Normalizada"] != area_antiga_norm]
+
+    # ids iguais não contam como mudança
+    ids_atuais = set(colabs["ID Área"].dropna().unique())
+    if ids_atuais:
+        trajeto_filtrado = trajeto_filtrado[~(
+            trajeto_filtrado["ID Área"].isin(ids_atuais) &
+            (trajeto_filtrado["Área Normalizada"] == area_antiga_norm)
+        )]
+
+    # se nunca mudou
+    if trajeto_filtrado.empty:
+        atual = colabs.sort_values("Data Referência")["Área"].iloc[-1]
+        return f"ℹ️ Permaneceu em: {atual} (última: {ult_data.strftime('%Y-%m-%d')})"
+
+    # considerar só áreas que ainda existem
+    data_final = df_ativos["Data Referência"].max()
+    base_atual = df_ativos[df_ativos["Data Referência"] == data_final]
+    ativos = set(base_atual["Área Normalizada"])
+    movs = trajeto_filtrado[trajeto_filtrado["Área Normalizada"].isin(ativos)]
+    if movs.empty:
+        return "⚠️ Área destino não existe mais na base atual."
+
+    # encontra destino mais comum
+    destino = movs["Área"].mode().iloc[0]
+    data_dest = movs[movs["Área"] == destino]["Data Referência"].max().strftime("%Y-%m-%d")
+
+    # prepara herança hierárquica
+    nome_to_sup   = base_atual.set_index("Nome")["Nome Imedi"].to_dict()
+    nome_to_area  = base_atual.set_index("Nome")["Área"].to_dict()
+    nome_to_nivel = base_atual.set_index("Nome")["Nivel"].to_dict()
+
+    def herdar(nome):
+        nv = nome_to_nivel.get(nome, 99)
+        diret = base_atual.set_index("Nome")["Diretoria"].to_dict().get(nome,"")
+        if nv > 11:
+            return nome_to_area.get(nome,""), [nome]
+        if "Distribuição Varejo" in diret or "Riscos" in diret or "Pessoas, Cultura e Agilidade" in diret:
+            alvo = 12
+        elif "Tecnologia e Dados" in diret:
+            alvo = 10
+        else:
+            alvo = 11
+        atual = nome
+        visit = set()
+        cand, best = atual, 99
+        trilha = [atual]
+        while atual in nome_to_sup and atual not in visit:
+            lvl = nome_to_nivel.get(atual,99)
+            if lvl >= alvo and lvl < best:
+                cand, best = atual, lvl
+            sup = nome_to_sup.get(atual,"")
+            if pd.isna(sup) or sup == atual:
+                break
+            visit.add(atual)
+            atual = sup
+            trilha.append(atual)
+        return nome_to_area.get(cand,""), trilha
+
+    exemplo = movs[movs["Área"] == destino]["Nome"].iloc[0]
+    area_f, trilha = herdar(exemplo)
+    trilha_str = " → ".join(trilha)
+
+    # históricos
+    hist_orig = (
+        df_ativos[df_ativos["Área Normalizada"] == area_antiga_norm]
+        [["Data Referência","Área"]]
+        .drop_duplicates()
+        .sort_values("Data Referência")
+    )
+    hist_orig_str = hist_orig.to_string(index=False)
+
+    hist_trans = (
+        trajeto[["Data Referência","Área"]]
+        .drop_duplicates()
+        .sort_values("Data Referência")
+    )
+    hist_trans_str = hist_trans.to_string(index=False)
+
+    return (
+        f"{area_f or destino} (última ocorrência: {data_dest})\n"
+        f"Trilha hierárquica: {trilha_str}\n\n"
+        f"Histórico da área '{area_antiga}':\n{hist_orig_str}\n\n"
+        f"Transições:\n{hist_trans_str}"
+    )
+
+# ------------------------------------------------------------------
+# Template HTML
+# ------------------------------------------------------------------
+html_form = """
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Consulta e De/Para em Lote</title>
+  <style>
+    body { font-family: sans-serif; margin: 40px; }
+    textarea { width: 100%; }
+    input, button { margin: 5px 0; }
+  </style>
+</head>
+<body>
+  <h1>Consulta de Área Atual</h1>
+  <form method="post">
+    <div>
+      <label>Área antiga:</label>
+      <input type="text" name="area_antiga" value="{{ request.form.area_antiga or '' }}">
+      <label>Login:</label>
+      <input type="text" name="login_usuario" value="{{ request.form.login_usuario or '' }}">
+    </div>
+    <div>
+      <button name="acao" value="Consultar">Consultar</button>
+      <button name="acao" value="👍 Correto">👍 Correto</button>
+      <button name="acao" value="👎 Errado">👎 Errado</button>
+    </div>
+    <input type="hidden" name="last_result" value="{{ resultado or '' }}">
+
+    <h2>Mapeamento em Lote (De → Para)</h2>
+    <div>
+      <textarea name="lista" rows="8" placeholder="Cole aqui áreas (uma por linha)">{{ request.form.lista or '' }}</textarea><br>
+      <button name="acao" value="Importar">Importar e Baixar Excel</button>
+    </div>
+  </form>
+
+  {% if resultado %}
+    <h3>Último Resultado</h3>
+    <pre>{{ resultado }}</pre>
+  {% endif %}
+  {% if mensagem %}
+    <p><strong>{{ mensagem }}</strong></p>
+  {% endif %}
+</body>
+</html>
+"""
+
+# ------------------------------------------------------------------
+# Rota principal
+# ------------------------------------------------------------------
+@app.route("/", methods=["GET","POST"])
+def home():
+    resultado = None
+    mensagem  = None
+
+    if request.method == "POST":
+        acao = request.form.get("acao","")
+
+        if acao == "Consultar":
+            area = request.form.get("area_antiga","").strip() or None
+            login= request.form.get("login_usuario","").strip() or None
+            resultado = consultar_area_atual(area_antiga=area, login_usuario=login)
+
+        elif acao in ["👍 Correto","👎 Errado"]:
+            ultima = request.form.get("last_result","")
+            if ultima:
+                confirmado = 1 if acao=="👍 Correto" else 0
+                area    = request.form.get("area_antiga","").strip()
+                login   = request.form.get("login_usuario","").strip()
+                prevista= ultima.split(" (")[0]
+                salvar_feedback(login, area, prevista, confirmado)
+                mensagem = "✅ Feedback registrado!"
+            else:
+                mensagem = "❌ Sem resultado anterior."
+
+        elif acao == "Importar":
+            texto = request.form.get("lista","")
+            linhas= [l.strip() for l in texto.splitlines() if l.strip()]
+            mape = []
+            for area_antiga in linhas:
+                res = consultar_area_atual(area_antiga=area_antiga)
+                prev = res.split(" (")[0]
+                mape.append({"Área Antiga": area_antiga, "Área Prevista": prev})
+
+            df = pd.DataFrame(mape)
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+                df.to_excel(writer, index=False, sheet_name="DePara")
+            output.seek(0)
+
+            return send_file(
+                output,
+                mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                as_attachment=True,
+                download_name="mapeamento_de_para.xlsx"
+            )
+
+    return render_template_string(html_form,
+                                  resultado=resultado,
+                                  mensagem=mensagem)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5001, debug=True)
